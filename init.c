@@ -31,8 +31,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/klog.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
@@ -706,6 +708,576 @@ static int cmd_exit(int argc, char **argv)
 	exit(argc > 1 ? atoi(argv[1]) : last_status);
 }
 
+/*
+ * memtest [rounds]
+ *
+ * Checks that every word stored is read back unchanged, in the two cases
+ * where libc data has been seen corrupted on SoC2:
+ *
+ *   fresh  each round maps 16 new anonymous pages, writes them and reads
+ *          them back. Every first store takes a TLB refill and a page
+ *          fault, as when the stack grows.
+ *   fork   a 16-page buffer is filled and the process forks. Parent and
+ *          child then keep rewriting the buffer with their own patterns and
+ *          checking it. The first write of each breaks copy-on-write; after
+ *          that each must only ever see its own values.
+ *
+ * Each word's pattern depends on its address, so a word read from the
+ * wrong place is detected as well as a stale value.
+ */
+#define MT_PAGES	16
+#define MT_SIZE		(MT_PAGES * 4096)
+#define MT_WORDS	(MT_SIZE / sizeof(unsigned long))
+
+static unsigned long mt_pattern(volatile unsigned long *p, unsigned long seed)
+{
+	return ((unsigned long)p * 2654435761UL) ^ seed;
+}
+
+static void mt_fill(volatile unsigned long *buf, unsigned long seed)
+{
+	for (size_t i = 0; i < MT_WORDS; i++)
+		buf[i] = mt_pattern(&buf[i], seed);
+}
+
+static long mt_check(volatile unsigned long *buf, unsigned long seed,
+		     const char *what, int round)
+{
+	long bad = 0;
+
+	for (size_t i = 0; i < MT_WORDS; i++) {
+		unsigned long exp = mt_pattern(&buf[i], seed);
+		unsigned long got = buf[i];
+
+		if (got != exp) {
+			if (bad < 4)
+				printf("  %s round %d: %p = %08lx, expected %08lx\n",
+				       what, round, (void *)&buf[i], got, exp);
+			bad++;
+		}
+	}
+	return bad;
+}
+
+static volatile unsigned long *mt_map(void)
+{
+	void *p = mmap(NULL, MT_SIZE, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (p == MAP_FAILED) {
+		perror("memtest: mmap");
+		return NULL;
+	}
+	return p;
+}
+
+static int cmd_memtest(int argc, char **argv)
+{
+	int rounds = argc > 1 ? atoi(argv[1]) : 100;
+	volatile unsigned long *buf;
+	long bad_fresh = 0, bad_parent = 0;
+	int child_bad = 0, st, r;
+	pid_t pid;
+
+	if (rounds < 1)
+		rounds = 1;
+	printf("memtest: %d rounds, %d pages\n", rounds, MT_PAGES);
+	fflush(stdout);
+
+	/* fresh pages */
+	for (r = 0; r < rounds; r++) {
+		buf = mt_map();
+		if (!buf)
+			return 1;
+		mt_fill(buf, 0x11111111UL + r);
+		bad_fresh += mt_check(buf, 0x11111111UL + r, "fresh", r);
+		munmap((void *)buf, MT_SIZE);
+	}
+	printf("  fresh pages: %ld bad words\n", bad_fresh);
+	fflush(stdout);
+
+	/* copy-on-write after fork */
+	buf = mt_map();
+	if (!buf)
+		return 1;
+	mt_fill(buf, 0x22222222UL);
+
+	pid = fork();
+	if (pid < 0) {
+		perror("memtest: fork");
+		munmap((void *)buf, MT_SIZE);
+		return 1;
+	}
+	if (pid == 0) {
+		long bad = 0;
+
+		for (r = 0; r < rounds; r++) {
+			mt_fill(buf, 0xc0c0c0c0UL ^ r);
+			bad += mt_check(buf, 0xc0c0c0c0UL ^ r, "child", r);
+		}
+		fflush(stdout);
+		_exit(bad ? 1 : 0);
+	}
+
+	for (r = 0; r < rounds; r++) {
+		mt_fill(buf, 0x5a5a5a5aUL ^ r);
+		bad_parent += mt_check(buf, 0x5a5a5a5aUL ^ r, "parent", r);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		perror("memtest: waitpid");
+	else if (WIFSIGNALED(st))
+		child_bad = -WTERMSIG(st);
+	else
+		child_bad = WEXITSTATUS(st);
+	munmap((void *)buf, MT_SIZE);
+
+	printf("  fork, parent: %ld bad words\n", bad_parent);
+	if (child_bad < 0)
+		printf("  fork, child: killed by %s\n", strsignal(-child_bad));
+	else
+		printf("  fork, child: %s\n", child_bad ? "bad words (see above)" : "0 bad words");
+
+	if (bad_fresh || bad_parent || child_bad) {
+		printf("memtest: FAIL\n");
+		return 1;
+	}
+	printf("memtest: PASS\n");
+	return 0;
+}
+
+/*
+ * snprintf crash test. The libc crash in vfprintf comes from the FILE
+ * that snprintf builds on the stack not being initialized. It shows up
+ * mostly when the first command after boot is ps, so test whether it is
+ * the first snprintf in a process that fails.
+ *
+ *   snp         one snprintf in this process (as PID 1, a crash panics)
+ *   snptest [n] n fresh processes (fork + exec /init --snptest), each
+ *               doing its first snprintf; counts crashes
+ */
+#define SNP_EXPECT	"/proc/1/stat"
+
+static int snp_once(void)
+{
+	char buf[64];
+	int n = snprintf(buf, sizeof(buf), "/proc/%s/stat", "1");
+
+	return (n == (int)strlen(SNP_EXPECT) && strcmp(buf, SNP_EXPECT) == 0) ? 0 : 3;
+}
+
+static int cmd_snp(int argc, char **argv)
+{
+	int r = snp_once();
+
+	printf("snp: %s\n", r ? "wrong result" : "ok");
+	return r;
+}
+
+static int cmd_snptest(int argc, char **argv)
+{
+	int n = argc > 1 ? atoi(argv[1]) : 20;
+	int ok = 0, wrong = 0, segv = 0, other = 0;
+
+	for (int i = 0; i < n; i++) {
+		pid_t pid;
+		int st;
+
+		fflush(stdout);
+		pid = fork();
+		if (pid < 0) {
+			perror("snptest: fork");
+			break;
+		}
+		if (pid == 0) {
+			char *av[] = { "/init", "--snptest", NULL };
+
+			execv("/init", av);
+			_exit(127);
+		}
+		if (waitpid(pid, &st, 0) < 0) {
+			perror("snptest: waitpid");
+			break;
+		}
+		if (WIFSIGNALED(st)) {
+			if (WTERMSIG(st) == SIGSEGV)
+				segv++;
+			else
+				other++;
+		} else if (WEXITSTATUS(st) == 0) {
+			ok++;
+		} else {
+			wrong++;
+		}
+	}
+	printf("snptest: %d runs: %d ok, %d SIGSEGV, %d other signal, %d wrong result or exec failed\n",
+	       n, ok, segv, other, wrong);
+	return segv || other || wrong;
+}
+
+/*
+ * fartest: does a call into a code page that is not mapped yet run the
+ * called function?
+ *
+ * In the snprintf crash, everything _IO_no_init() should store into the
+ * FILE is missing, while the stores before and after the call are there,
+ * as if the call returned without running the function. It happens on
+ * the first use of that code in a process, when the call target is on a
+ * page that is not mapped yet and the fetch takes a TLB refill and a
+ * page fault.
+ *
+ * far1() and far2() are each on their own 64 KB aligned block, so the
+ * kernel's fault-around does not map them before they are called. Each
+ * child calls both once and reports the return values, the stores and
+ * the number of page faults the call took (getrusage ru_minflt).
+ */
+struct far_rec {
+	unsigned long a, b, c, d;
+};
+
+#define FAR_FN(sec) __attribute__((noinline, noclone, aligned(65536), section(sec)))
+
+FAR_FN(".text.soc2_far1")
+static int far1(struct far_rec *r)
+{
+	r->a = 0x11111111;
+	r->b = 0x22222222;
+	r->c = 0x33333333;
+	r->d = 0x44444444;
+	return 0x5a;
+}
+
+FAR_FN(".text.soc2_far2")
+static int far2(struct far_rec *r)
+{
+	r->a = 0x55555555;
+	r->b = 0x66666666;
+	r->c = 0x77777777;
+	r->d = 0x88888888;
+	return 0xa5;
+}
+
+/*
+ * far3 runs straight through a 64 KB boundary: a and b are stored in the
+ * first block, then 64 KB of nops, then c and d in the next block. The
+ * fault on the first block maps only that block (fault-around), so the
+ * fetch of the second block faults in the middle of the function, after
+ * a plain sequential fetch, not after a branch.
+ */
+FAR_FN(".text.soc2_far3")
+static int far3(struct far_rec *r)
+{
+	r->a = 0x99999999;
+	r->b = 0xaaaaaaaa;
+	__asm__ volatile(".rept 16384\n\tnop\n\t.endr" ::: "memory");
+	r->c = 0xbbbbbbbb;
+	r->d = 0xcccccccc;
+	return 0x3c;
+}
+
+/*
+ * far4 is the libc case: vsnprintf calls _IO_no_init, which is on the
+ * other page of the same ITLB pair, mapped by fault-around but not yet
+ * valid (PTE present, V=0). far4 starts a 64 KB block (even page), its
+ * callee is 4 KB further (odd page of the same pair). Running far4 makes
+ * the pair's ITLB entry valid for the even page only, so the call is a
+ * branch into an ITLB hit with V=0, which must raise PIF. If the callee
+ * is skipped, b and c stay 0 and the return value is wrong.
+ */
+/*
+ * Written in assembly so the layout is exact: the compiler placed a C
+ * callee in another 64 KB block. far4 starts a 64 KB block (even page of
+ * an ITLB pair), far4_callee is at far4 + 0x1000 (odd page of the same
+ * pair). struct far_rec: a at 0, b at 4, c at 8, d at 12.
+ */
+int far4(struct far_rec *r);
+int far4_callee(struct far_rec *r);
+
+__asm__(
+	"	.pushsection .text.soc2_far4, \"ax\", @progbits\n"
+	"	.balign	65536\n"
+	"	.globl	far4\n"
+	"	.type	far4, @function\n"
+	"far4:\n"
+	"	addi.w	$r3, $r3, -16\n"
+	"	st.w	$r1, $r3, 12\n"
+	"	st.w	$r4, $r3, 8\n"
+	"	li.w	$r12, 0xdddddddd\n"
+	"	st.w	$r12, $r4, 0\n"		/* r->a */
+	"	bl	far4_callee\n"		/* into the odd page of this pair */
+	"	ld.w	$r5, $r3, 8\n"
+	"	li.w	$r12, 0x12345678\n"
+	"	st.w	$r12, $r5, 12\n"	/* r->d */
+	"	ld.w	$r1, $r3, 12\n"
+	"	addi.w	$r3, $r3, 16\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far4, . - far4\n"
+	"	.org	0x1000\n"
+	"	.globl	far4_callee\n"
+	"	.type	far4_callee, @function\n"
+	"far4_callee:\n"
+	"	li.w	$r12, 0xeeeeeeee\n"
+	"	st.w	$r12, $r4, 4\n"		/* r->b */
+	"	li.w	$r12, 0xffffffff\n"
+	"	st.w	$r12, $r4, 8\n"		/* r->c */
+	"	li.w	$r4, 0x77\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far4_callee, . - far4_callee\n"
+	"	.popsection\n");
+
+/*
+ * far5 is the exact libc case. vsnprintf calls _IO_no_init, which is on
+ * a page that fault-around already mapped (PTE present, V=0) but whose
+ * ITLB pair is not in the TLB. The call then takes two exceptions on the
+ * same target: TLB refill (loads the pair with V=0), then PIF, handled by
+ * the fast path in tlbex-32.S (sets V, tlbwr), then ertn to the target.
+ *
+ * far5 starts a 64 KB block; its first fetch faults the block in, so
+ * fault-around maps the other pages of the block. It then calls into two
+ * other pairs of the block: far5_even at +0x2000 (even page of pair 2/3)
+ * and far5_odd at +0x5000 (odd page of pair 4/5). Neither pair is in the
+ * ITLB at the time of the call.
+ */
+int far5(struct far_rec *r);
+
+__asm__(
+	"	.pushsection .text.soc2_far5, \"ax\", @progbits\n"
+	"	.balign	65536\n"
+	"	.globl	far5\n"
+	"	.type	far5, @function\n"
+	"far5:\n"
+	"	addi.w	$r3, $r3, -16\n"
+	"	st.w	$r1, $r3, 12\n"
+	"	st.w	$r4, $r3, 8\n"
+	"	li.w	$r12, 0x13131313\n"
+	"	st.w	$r12, $r4, 0\n"		/* r->a */
+	"	bl	far5_even\n"		/* new pair, even page */
+	"	ld.w	$r4, $r3, 8\n"
+	"	bl	far5_odd\n"		/* new pair, odd page, returns 0x55 */
+	"	ld.w	$r5, $r3, 8\n"
+	"	li.w	$r12, 0x46464646\n"
+	"	st.w	$r12, $r5, 12\n"	/* r->d */
+	"	ld.w	$r1, $r3, 12\n"
+	"	addi.w	$r3, $r3, 16\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far5, . - far5\n"
+	"	.org	0x2000\n"
+	"	.type	far5_even, @function\n"
+	"far5_even:\n"
+	"	li.w	$r12, 0x24242424\n"
+	"	st.w	$r12, $r4, 4\n"		/* r->b */
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far5_even, . - far5_even\n"
+	"	.org	0x5000\n"
+	"	.type	far5_odd, @function\n"
+	"far5_odd:\n"
+	"	li.w	$r12, 0x35353535\n"
+	"	st.w	$r12, $r4, 8\n"		/* r->c */
+	"	li.w	$r4, 0x55\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far5_odd, . - far5_odd\n"
+	"	.popsection\n");
+
+/*
+ * far6..far8: is the first instruction of a page skipped when execution
+ * runs into that page sequentially and its fetch faults?
+ *
+ * In libc, "bl _IO_no_init" is at offset 0x70000, the first word of a
+ * page; the instruction before it (0x6fffc) is the last word of the
+ * previous page, which is the even page of the same ITLB pair. If the
+ * bl is lost after the fetch fault, _IO_no_init never runs and vsnprintf
+ * continues at 0x70004, which is what the crash dumps show. far3 crossed
+ * a page boundary too, but on a nop, where a lost instruction is not
+ * visible.
+ *
+ * far6  the libc layout: store at 0xffc, bl at 0x1000 (odd page of the
+ *       pair, mapped by fault-around, V=0)
+ * far7  the same, with a store at 0x1000
+ * far8  a store at the first word of the next 64 KB block
+ *
+ * The unused gaps are filled with zeros; they are jumped over, never
+ * executed.
+ */
+int far6(struct far_rec *r);
+int far7(struct far_rec *r);
+int far8(struct far_rec *r);
+
+__asm__(
+	"	.pushsection .text.soc2_far6, \"ax\", @progbits\n"
+	"	.balign	65536\n"
+	"	.globl	far6\n"
+	"	.type	far6, @function\n"
+	"far6:\n"
+	"	addi.w	$r3, $r3, -16\n"
+	"	st.w	$r1, $r3, 12\n"
+	"	st.w	$r4, $r3, 8\n"
+	"	li.w	$r12, 0x61616161\n"
+	"	st.w	$r12, $r4, 0\n"		/* r->a */
+	"	b	1f\n"
+	"	.org	0xffc\n"
+	"1:	st.w	$r4, $r3, 4\n"		/* last word of the even page */
+	"	bl	far6_callee\n"		/* first word of the odd page */
+	"	ld.w	$r5, $r3, 8\n"
+	"	li.w	$r12, 0x64646464\n"
+	"	st.w	$r12, $r5, 12\n"	/* r->d */
+	"	ld.w	$r1, $r3, 12\n"
+	"	addi.w	$r3, $r3, 16\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far6, . - far6\n"
+	"	.org	0x1100\n"
+	"	.type	far6_callee, @function\n"
+	"far6_callee:\n"
+	"	li.w	$r12, 0x62626262\n"
+	"	st.w	$r12, $r4, 4\n"		/* r->b */
+	"	li.w	$r12, 0x63636363\n"
+	"	st.w	$r12, $r4, 8\n"		/* r->c */
+	"	li.w	$r4, 0x66\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far6_callee, . - far6_callee\n"
+	"	.popsection\n"
+
+	"	.pushsection .text.soc2_far7, \"ax\", @progbits\n"
+	"	.balign	65536\n"
+	"	.globl	far7\n"
+	"	.type	far7, @function\n"
+	"far7:\n"
+	"	li.w	$r12, 0x71717171\n"
+	"	st.w	$r12, $r4, 0\n"		/* r->a */
+	"	li.w	$r13, 0x72727272\n"
+	"	li.w	$r14, 0x73737373\n"
+	"	b	1f\n"
+	"	.org	0xffc\n"
+	"1:	st.w	$r13, $r4, 4\n"		/* r->b, last word of the even page */
+	"	st.w	$r14, $r4, 8\n"		/* r->c, first word of the odd page */
+	"	li.w	$r12, 0x74747474\n"
+	"	st.w	$r12, $r4, 12\n"	/* r->d */
+	"	li.w	$r4, 0x77\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far7, . - far7\n"
+	"	.popsection\n"
+
+	"	.pushsection .text.soc2_far8, \"ax\", @progbits\n"
+	"	.balign	65536\n"
+	"	.globl	far8\n"
+	"	.type	far8, @function\n"
+	"far8:\n"
+	"	li.w	$r12, 0x81818181\n"
+	"	st.w	$r12, $r4, 0\n"		/* r->a */
+	"	li.w	$r13, 0x82828282\n"
+	"	li.w	$r14, 0x83838383\n"
+	"	b	1f\n"
+	"	.org	0xfffc\n"
+	"1:	st.w	$r13, $r4, 4\n"		/* r->b, last word of the 64 KB block */
+	"	st.w	$r14, $r4, 8\n"		/* r->c, first word of the next block */
+	"	li.w	$r12, 0x84848484\n"
+	"	st.w	$r12, $r4, 12\n"	/* r->d */
+	"	li.w	$r4, 0x88\n"
+	"	jirl	$r0, $r1, 0\n"
+	"	.size	far8, . - far8\n"
+	"	.popsection\n");
+
+static long minflt(void)
+{
+	struct rusage ru;
+
+	getrusage(RUSAGE_SELF, &ru);
+	return ru.ru_minflt;
+}
+
+static int far_call(const char *name, int (*fn)(struct far_rec *), int want,
+		    const struct far_rec *exp)
+{
+	struct far_rec r = { 0, 0, 0, 0 };
+	long f0, f1;
+	int ret, stores_ok;
+
+	f0 = minflt();
+	ret = fn(&r);
+	f1 = minflt();
+
+	stores_ok = r.a == exp->a && r.b == exp->b &&
+		    r.c == exp->c && r.d == exp->d;
+	printf("  %s: ret %s, stores %s, page faults in call %ld%s\n", name,
+	       ret == want ? "ok" : "WRONG", stores_ok ? "ok" : "WRONG", f1 - f0,
+	       f1 == f0 ? " (page was mapped, path not tested)" : "");
+	if (!stores_ok)
+		printf("    got a=%08lx b=%08lx c=%08lx d=%08lx\n",
+		       r.a, r.b, r.c, r.d);
+	return (ret == want && stores_ok) ? 0 : 1;
+}
+
+static int far_once(void)
+{
+	static const struct far_rec e1 = { 0x11111111, 0x22222222, 0x33333333, 0x44444444 };
+	static const struct far_rec e2 = { 0x55555555, 0x66666666, 0x77777777, 0x88888888 };
+	static const struct far_rec e3 = { 0x99999999, 0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc };
+	static const struct far_rec e4 = { 0xdddddddd, 0xeeeeeeee, 0xffffffff, 0x12345678 };
+	static const struct far_rec e5 = { 0x13131313, 0x24242424, 0x35353535, 0x46464646 };
+	static const struct far_rec e6 = { 0x61616161, 0x62626262, 0x63636363, 0x64646464 };
+	static const struct far_rec e7 = { 0x71717171, 0x72727272, 0x73737373, 0x74747474 };
+	static const struct far_rec e8 = { 0x81818181, 0x82828282, 0x83838383, 0x84848484 };
+	int bad = 0;
+
+	/* page-boundary tests first, before other calls map neighbouring blocks */
+	bad |= far_call("far6", far6, 0x66, &e6) << 5;
+	bad |= far_call("far7", far7, 0x77, &e7) << 6;
+	bad |= far_call("far8", far8, 0x88, &e8) << 7;
+
+	bad |= far_call("far1", far1, 0x5a, &e1);
+	bad |= far_call("far2", far2, 0xa5, &e2) << 1;
+	bad |= far_call("far3", far3, 0x3c, &e3) << 2;
+	/* far4 must be on the even page and its callee on the odd page of one pair */
+	if (((unsigned long)far4 & ~0x1fffUL) != ((unsigned long)far4_callee & ~0x1fffUL) ||
+	    !((unsigned long)far4_callee & 0x1000))
+		printf("  far4: layout not as intended (far4 %p, callee %p), result not meaningful\n",
+		       (void *)far4, (void *)far4_callee);
+	bad |= far_call("far4", far4, 0x77, &e4) << 3;
+	bad |= far_call("far5", far5, 0x55, &e5) << 4;
+	fflush(stdout);
+	return bad;
+}
+
+static int cmd_fartest(int argc, char **argv)
+{
+	int n = argc > 1 ? atoi(argv[1]) : 10;
+	int ok = 0, bad = 0, sig = 0;
+
+	printf("fartest: far1 at %p, far2 at %p, far3 at %p, far4 at %p calls %p, far5 at %p,\n"
+	       "         far6 at %p, far7 at %p, far8 at %p, %d fresh processes\n",
+	       (void *)far1, (void *)far2, (void *)far3, (void *)far4,
+	       (void *)far4_callee, (void *)far5, (void *)far6, (void *)far7,
+	       (void *)far8, n);
+	for (int i = 0; i < n; i++) {
+		pid_t pid;
+		int st;
+
+		fflush(stdout);
+		pid = fork();
+		if (pid < 0) {
+			perror("fartest: fork");
+			break;
+		}
+		if (pid == 0) {
+			char *av[] = { "/init", "--fartest", NULL };
+
+			execv("/init", av);
+			_exit(127);
+		}
+		if (waitpid(pid, &st, 0) < 0) {
+			perror("fartest: waitpid");
+			break;
+		}
+		if (WIFSIGNALED(st))
+			sig++;
+		else if (WEXITSTATUS(st) == 0)
+			ok++;
+		else
+			bad++;
+	}
+	printf("fartest: %d ok, %d with a wrong result, %d killed by a signal\n",
+	       ok, bad, sig);
+	return bad || sig;
+}
+
 struct builtin {
 	const char *name;
 	int (*fn)(int argc, char **argv);
@@ -740,6 +1312,10 @@ static const struct builtin builtins[] = {
 	{ "sync",     cmd_sync,     "flush file system buffers" },
 	{ "reboot",   cmd_reboot,   "restart the system" },
 	{ "poweroff", cmd_poweroff, "power off the system" },
+	{ "memtest",  cmd_memtest,  "memtest [rounds]: store/load check, fresh pages and fork" },
+	{ "snp",      cmd_snp,      "one snprintf in this process" },
+	{ "snptest",  cmd_snptest,  "snptest [n]: first snprintf in n fresh processes" },
+	{ "fartest",  cmd_fartest,  "fartest [n]: call into an unmapped code page in n fresh processes" },
 	{ "exit",     cmd_exit,     "exit [status] (not allowed as init)" },
 };
 
@@ -1271,6 +1847,13 @@ int main(int argc, char **argv)
 	struct token tok[MAX_TOKENS];
 	struct pipeline pl;
 	struct utsname u;
+
+	/* child of snptest: only the first snprintf of a fresh process */
+	if (argc > 1 && strcmp(argv[1], "--snptest") == 0)
+		return snp_once();
+	/* child of fartest: first call into far1/far2 */
+	if (argc > 1 && strcmp(argv[1], "--fartest") == 0)
+		return far_once();
 
 	is_init = getpid() == 1;
 	if (is_init) {
