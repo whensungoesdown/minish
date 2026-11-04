@@ -26,6 +26,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,8 @@
 #include <sys/reboot.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -1278,6 +1282,1038 @@ static int cmd_fartest(int argc, char **argv)
 	return bad || sig;
 }
 
+/*
+ * Upstream GCC/clang define __loongarch__; older Loongson toolchains may
+ * only define one of the other names. Check with:
+ *   loongarch32r-linux-gnusf-gcc -dM -E - </dev/null | grep -i loongarch
+ */
+#if defined(__loongarch__) || defined(__loongarch) || \
+    defined(__loongarch32) || defined(__loongarch64)
+#define MD_HAVE_ASM 1
+#else
+#define MD_HAVE_ASM 0
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Dhrystone 2.1                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Dhrystone 2.1 by Reinhold P. Weicker (public domain), following the C
+ * version by Rick Richardson. The benchmark code is unchanged, except:
+ *   - the procedures are noinline/noclone, so that -O2 cannot inline
+ *     them into the loop or specialise them for the constant arguments
+ *   - the two records are static instead of malloc'ed
+ *   - two locals that the original leaves uninitialised are initialised
+ *     (their values are always overwritten before use)
+ *
+ * dhrystone [runs] [MHz]
+ *   Without runs, the number of runs is calibrated to about 2 s. MHz is
+ *   the CPU clock used for DMIPS/MHz, 75 by default (SoC2 sys_clk).
+ *   DMIPS = Dhrystones per second / 1757 (VAX 11/780).
+ *
+ * At the end the global and local values are checked against the
+ * values the original program prints as "should be", so the run is
+ * also a correctness test of the CPU.
+ */
+typedef enum { Ident_1, Ident_2, Ident_3, Ident_4, Ident_5 } Enumeration;
+
+typedef struct dhry_record {
+	struct dhry_record *Ptr_Comp;
+	Enumeration Discr;
+	union {
+		struct {
+			Enumeration Enum_Comp;
+			int Int_Comp;
+			char Str_Comp[31];
+		} var_1;
+		struct {
+			Enumeration E_Comp_2;
+			char Str_2_Comp[31];
+		} var_2;
+		struct {
+			char Ch_1_Comp;
+			char Ch_2_Comp;
+		} var_3;
+	} variant;
+} Rec_Type, *Rec_Pointer;
+
+static Rec_Type dhry_rec[2];
+static Rec_Pointer Ptr_Glob, Next_Ptr_Glob;
+static int Int_Glob;
+static int Bool_Glob;
+static char Ch_1_Glob, Ch_2_Glob;
+static int Arr_1_Glob[50];
+static int Arr_2_Glob[50][50];
+
+#define DHRY_PROC __attribute__((noinline, noclone))
+
+DHRY_PROC static void Proc_1(Rec_Pointer Ptr_Val_Par);
+DHRY_PROC static void Proc_2(int *Int_Par_Ref);
+DHRY_PROC static void Proc_3(Rec_Pointer *Ptr_Ref_Par);
+DHRY_PROC static void Proc_4(void);
+DHRY_PROC static void Proc_5(void);
+DHRY_PROC static void Proc_6(Enumeration Enum_Val_Par, Enumeration *Enum_Ref_Par);
+DHRY_PROC static void Proc_7(int Int_1_Par_Val, int Int_2_Par_Val, int *Int_Par_Ref);
+DHRY_PROC static void Proc_8(int Arr_1_Par_Ref[50], int Arr_2_Par_Ref[50][50],
+			     int Int_1_Par_Val, int Int_2_Par_Val);
+DHRY_PROC static Enumeration Func_1(char Ch_1_Par_Val, char Ch_2_Par_Val);
+DHRY_PROC static int Func_2(char *Str_1_Par_Ref, char *Str_2_Par_Ref);
+DHRY_PROC static int Func_3(Enumeration Enum_Par_Val);
+
+static void Proc_1(Rec_Pointer Ptr_Val_Par)
+{
+	Rec_Pointer Next_Record = Ptr_Val_Par->Ptr_Comp;
+
+	*Ptr_Val_Par->Ptr_Comp = *Ptr_Glob;
+	Ptr_Val_Par->variant.var_1.Int_Comp = 5;
+	Next_Record->variant.var_1.Int_Comp = Ptr_Val_Par->variant.var_1.Int_Comp;
+	Next_Record->Ptr_Comp = Ptr_Val_Par->Ptr_Comp;
+	Proc_3(&Next_Record->Ptr_Comp);
+	if (Next_Record->Discr == Ident_1) {
+		Next_Record->variant.var_1.Int_Comp = 6;
+		Proc_6(Ptr_Val_Par->variant.var_1.Enum_Comp,
+		       &Next_Record->variant.var_1.Enum_Comp);
+		Next_Record->Ptr_Comp = Ptr_Glob->Ptr_Comp;
+		Proc_7(Next_Record->variant.var_1.Int_Comp, 10,
+		       &Next_Record->variant.var_1.Int_Comp);
+	} else {
+		*Ptr_Val_Par = *Ptr_Val_Par->Ptr_Comp;
+	}
+}
+
+static void Proc_2(int *Int_Par_Ref)
+{
+	int Int_Loc;
+	Enumeration Enum_Loc = Ident_2;
+
+	Int_Loc = *Int_Par_Ref + 10;
+	do {
+		if (Ch_1_Glob == 'A') {
+			Int_Loc -= 1;
+			*Int_Par_Ref = Int_Loc - Int_Glob;
+			Enum_Loc = Ident_1;
+		}
+	} while (Enum_Loc != Ident_1);
+}
+
+static void Proc_3(Rec_Pointer *Ptr_Ref_Par)
+{
+	if (Ptr_Glob != NULL)
+		*Ptr_Ref_Par = Ptr_Glob->Ptr_Comp;
+	Proc_7(10, Int_Glob, &Ptr_Glob->variant.var_1.Int_Comp);
+}
+
+static void Proc_4(void)
+{
+	int Bool_Loc;
+
+	Bool_Loc = Ch_1_Glob == 'A';
+	Bool_Glob = Bool_Loc | Bool_Glob;
+	Ch_2_Glob = 'B';
+}
+
+static void Proc_5(void)
+{
+	Ch_1_Glob = 'A';
+	Bool_Glob = 0;
+}
+
+static void Proc_6(Enumeration Enum_Val_Par, Enumeration *Enum_Ref_Par)
+{
+	*Enum_Ref_Par = Enum_Val_Par;
+	if (!Func_3(Enum_Val_Par))
+		*Enum_Ref_Par = Ident_4;
+	switch (Enum_Val_Par) {
+	case Ident_1:
+		*Enum_Ref_Par = Ident_1;
+		break;
+	case Ident_2:
+		if (Int_Glob > 100)
+			*Enum_Ref_Par = Ident_1;
+		else
+			*Enum_Ref_Par = Ident_4;
+		break;
+	case Ident_3:
+		*Enum_Ref_Par = Ident_2;
+		break;
+	case Ident_4:
+		break;
+	case Ident_5:
+		*Enum_Ref_Par = Ident_3;
+		break;
+	}
+}
+
+static void Proc_7(int Int_1_Par_Val, int Int_2_Par_Val, int *Int_Par_Ref)
+{
+	int Int_Loc;
+
+	Int_Loc = Int_1_Par_Val + 2;
+	*Int_Par_Ref = Int_2_Par_Val + Int_Loc;
+}
+
+static void Proc_8(int Arr_1_Par_Ref[50], int Arr_2_Par_Ref[50][50],
+		   int Int_1_Par_Val, int Int_2_Par_Val)
+{
+	int Int_Index, Int_Loc;
+
+	Int_Loc = Int_1_Par_Val + 5;
+	Arr_1_Par_Ref[Int_Loc] = Int_2_Par_Val;
+	Arr_1_Par_Ref[Int_Loc + 1] = Arr_1_Par_Ref[Int_Loc];
+	Arr_1_Par_Ref[Int_Loc + 30] = Int_Loc;
+	for (Int_Index = Int_Loc; Int_Index <= Int_Loc + 1; ++Int_Index)
+		Arr_2_Par_Ref[Int_Loc][Int_Index] = Int_Loc;
+	Arr_2_Par_Ref[Int_Loc][Int_Loc - 1] += 1;
+	Arr_2_Par_Ref[Int_Loc + 20][Int_Loc] = Arr_1_Par_Ref[Int_Loc];
+	Int_Glob = 5;
+}
+
+static Enumeration Func_1(char Ch_1_Par_Val, char Ch_2_Par_Val)
+{
+	char Ch_1_Loc, Ch_2_Loc;
+
+	Ch_1_Loc = Ch_1_Par_Val;
+	Ch_2_Loc = Ch_1_Loc;
+	if (Ch_2_Loc != Ch_2_Par_Val)
+		return Ident_1;
+	Ch_1_Glob = Ch_1_Loc;
+	return Ident_2;
+}
+
+static int Func_2(char *Str_1_Par_Ref, char *Str_2_Par_Ref)
+{
+	int Int_Loc;
+	char Ch_Loc = 0;
+
+	Int_Loc = 2;
+	while (Int_Loc <= 2) {
+		if (Func_1(Str_1_Par_Ref[Int_Loc], Str_2_Par_Ref[Int_Loc + 1]) == Ident_1) {
+			Ch_Loc = 'A';
+			Int_Loc += 1;
+		}
+	}
+	if (Ch_Loc >= 'W' && Ch_Loc < 'Z')
+		Int_Loc = 7;
+	if (Ch_Loc == 'R')
+		return 1;
+	if (strcmp(Str_1_Par_Ref, Str_2_Par_Ref) > 0) {
+		Int_Loc += 7;
+		Int_Glob = Int_Loc;
+		return 1;
+	}
+	return 0;
+}
+
+static int Func_3(Enumeration Enum_Par_Val)
+{
+	Enumeration Enum_Loc;
+
+	Enum_Loc = Enum_Par_Val;
+	return Enum_Loc == Ident_3;
+}
+
+/* final values of the main program locals, for the result check */
+struct dhry_locals {
+	int Int_1_Loc, Int_2_Loc, Int_3_Loc;
+	Enumeration Enum_Loc;
+	char Str_1_Loc[31], Str_2_Loc[31];
+};
+
+static void dhry_run(long Number_Of_Runs, struct dhry_locals *out)
+{
+	int Int_1_Loc = 0, Int_2_Loc = 0, Int_3_Loc = 0;
+	char Ch_Index;
+	Enumeration Enum_Loc = Ident_1;
+	char Str_1_Loc[31], Str_2_Loc[31];
+	long Run_Index;
+
+	memset(dhry_rec, 0, sizeof(dhry_rec));
+	memset(Arr_1_Glob, 0, sizeof(Arr_1_Glob));
+	memset(Arr_2_Glob, 0, sizeof(Arr_2_Glob));
+	Int_Glob = 0;
+	Bool_Glob = 0;
+	Ch_1_Glob = 0;
+	Ch_2_Glob = 0;
+	Str_2_Loc[0] = '\0';
+
+	Next_Ptr_Glob = &dhry_rec[1];
+	Ptr_Glob = &dhry_rec[0];
+
+	Ptr_Glob->Ptr_Comp = Next_Ptr_Glob;
+	Ptr_Glob->Discr = Ident_1;
+	Ptr_Glob->variant.var_1.Enum_Comp = Ident_3;
+	Ptr_Glob->variant.var_1.Int_Comp = 40;
+	strcpy(Ptr_Glob->variant.var_1.Str_Comp, "DHRYSTONE PROGRAM, SOME STRING");
+	strcpy(Str_1_Loc, "DHRYSTONE PROGRAM, 1'ST STRING");
+
+	Arr_2_Glob[8][7] = 10;
+
+	for (Run_Index = 1; Run_Index <= Number_Of_Runs; ++Run_Index) {
+		Proc_5();
+		Proc_4();
+		Int_1_Loc = 2;
+		Int_2_Loc = 3;
+		strcpy(Str_2_Loc, "DHRYSTONE PROGRAM, 2'ND STRING");
+		Enum_Loc = Ident_2;
+		Bool_Glob = !Func_2(Str_1_Loc, Str_2_Loc);
+		while (Int_1_Loc < Int_2_Loc) {
+			Int_3_Loc = 5 * Int_1_Loc - Int_2_Loc;
+			Proc_7(Int_1_Loc, Int_2_Loc, &Int_3_Loc);
+			Int_1_Loc += 1;
+		}
+		Proc_8(Arr_1_Glob, Arr_2_Glob, Int_1_Loc, Int_3_Loc);
+		Proc_1(Ptr_Glob);
+		for (Ch_Index = 'A'; Ch_Index <= Ch_2_Glob; ++Ch_Index) {
+			if (Enum_Loc == Func_1(Ch_Index, 'C')) {
+				Proc_6(Ident_1, &Enum_Loc);
+				strcpy(Str_2_Loc, "DHRYSTONE PROGRAM, 3'RD STRING");
+				Int_2_Loc = Run_Index;
+				Int_Glob = Run_Index;
+			}
+		}
+		Int_2_Loc = Int_2_Loc * Int_1_Loc;
+		Int_1_Loc = Int_2_Loc / Int_3_Loc;
+		Int_2_Loc = 7 * (Int_2_Loc - Int_3_Loc) - Int_1_Loc;
+		Proc_2(&Int_1_Loc);
+	}
+
+	out->Int_1_Loc = Int_1_Loc;
+	out->Int_2_Loc = Int_2_Loc;
+	out->Int_3_Loc = Int_3_Loc;
+	out->Enum_Loc = Enum_Loc;
+	strcpy(out->Str_1_Loc, Str_1_Loc);
+	strcpy(out->Str_2_Loc, Str_2_Loc);
+}
+
+/* compare with the "should be" values of the original program */
+static int dhry_check(long runs, const struct dhry_locals *l)
+{
+	static const char some[] = "DHRYSTONE PROGRAM, SOME STRING";
+	int ok = 1;
+
+#define DHRY_EXPECT(cond)						\
+	do {								\
+		if (!(cond)) {						\
+			printf("  wrong: %s\n", #cond);			\
+			ok = 0;						\
+		}							\
+	} while (0)
+
+	DHRY_EXPECT(Int_Glob == 5);
+	DHRY_EXPECT(Bool_Glob == 1);
+	DHRY_EXPECT(Ch_1_Glob == 'A');
+	DHRY_EXPECT(Ch_2_Glob == 'B');
+	DHRY_EXPECT(Arr_1_Glob[8] == 7);
+	DHRY_EXPECT(Arr_2_Glob[8][7] == runs + 10);
+	DHRY_EXPECT(Ptr_Glob->Ptr_Comp == Next_Ptr_Glob->Ptr_Comp);
+	DHRY_EXPECT(Ptr_Glob->Discr == Ident_1);
+	DHRY_EXPECT(Ptr_Glob->variant.var_1.Enum_Comp == Ident_3);
+	DHRY_EXPECT(Ptr_Glob->variant.var_1.Int_Comp == 17);
+	DHRY_EXPECT(strcmp(Ptr_Glob->variant.var_1.Str_Comp, some) == 0);
+	DHRY_EXPECT(Next_Ptr_Glob->Discr == Ident_1);
+	DHRY_EXPECT(Next_Ptr_Glob->variant.var_1.Enum_Comp == Ident_2);
+	DHRY_EXPECT(Next_Ptr_Glob->variant.var_1.Int_Comp == 18);
+	DHRY_EXPECT(strcmp(Next_Ptr_Glob->variant.var_1.Str_Comp, some) == 0);
+	DHRY_EXPECT(l->Int_1_Loc == 5);
+	DHRY_EXPECT(l->Int_2_Loc == 13);
+	DHRY_EXPECT(l->Int_3_Loc == 7);
+	DHRY_EXPECT(l->Enum_Loc == Ident_2);
+	DHRY_EXPECT(strcmp(l->Str_1_Loc, "DHRYSTONE PROGRAM, 1'ST STRING") == 0);
+	DHRY_EXPECT(strcmp(l->Str_2_Loc, "DHRYSTONE PROGRAM, 2'ND STRING") == 0);
+
+#undef DHRY_EXPECT
+	return ok;
+}
+
+/*
+ * Time sources, tried in this order:
+ *   clock_gettime(CLOCK_MONOTONIC) through glibc (vDSO or system call)
+ *   the clock_gettime system call directly
+ *   the gettimeofday system call
+ *   the raw stable counter (rdcntvl.w / rdcntvh.w) at the given MHz; on
+ *   cpu7b it counts sys_clk cycles
+ *
+ * glibc 2.27 uses the 32-bit time system calls (clock_gettime,
+ * nanosleep, clock_nanosleep). A 32-bit kernel only provides them with
+ * CONFIG_COMPAT_32BIT_TIME=y; without it they fail with ENOSYS, so
+ * clock_gettime and nanosleep do not work at all. gettimeofday is
+ * always provided, so it is used as a fallback for both.
+ */
+enum { CLK_VDSO, CLK_SYSCALL, CLK_GTOD, CLK_COUNTER, NCLK };
+static const char *const clk_name[NCLK] = {
+	"clock_gettime (glibc)", "clock_gettime system call",
+	"gettimeofday system call", "stable counter",
+};
+static int clk_src = CLK_VDSO;
+static double clk_mhz = 75.0;
+
+static uint64_t clk_counter(void)
+{
+#if MD_HAVE_ASM
+	uint32_t hi, lo, hi2;
+
+	do {
+		__asm__ volatile("rdcntvh.w %0" : "=r"(hi));
+		__asm__ volatile("rdcntvl.w %0" : "=r"(lo));
+		__asm__ volatile("rdcntvh.w %0" : "=r"(hi2));
+	} while (hi != hi2);
+	return ((uint64_t)hi << 32) | lo;
+#else
+	return 0;	/* no inline asm: counter not available */
+#endif
+}
+
+/* seconds from one time source; -1 if it is not available */
+static double clk_read(int src)
+{
+	struct timespec ts = { 0, 0 };
+	struct timeval tv = { 0, 0 };
+	long r;
+
+	switch (src) {
+	case CLK_VDSO:
+		r = clock_gettime(CLOCK_MONOTONIC, &ts);
+		break;
+	case CLK_SYSCALL:
+#ifdef SYS_clock_gettime
+		r = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+#else
+		r = -1;
+#endif
+		break;
+	case CLK_GTOD:
+#ifdef SYS_gettimeofday
+		r = syscall(SYS_gettimeofday, &tv, NULL);
+#else
+		r = gettimeofday(&tv, NULL);
+#endif
+		return r ? -1 : tv.tv_sec + tv.tv_usec / 1e6;
+	default:
+		return MD_HAVE_ASM ? clk_counter() / (clk_mhz * 1e6) : -1;
+	}
+	return r ? -1 : ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static double dhry_now(void)
+{
+	return clk_read(clk_src);
+}
+
+static int sleep_errno;		/* errno of the last failed nanosleep, 0 if it worked */
+
+/*
+ * Sleep for ms milliseconds. Without CONFIG_COMPAT_32BIT_TIME nanosleep
+ * fails at once with ENOSYS; then wait on gettimeofday, yielding the CPU.
+ */
+static void dhry_sleep_ms(long ms)
+{
+	struct timespec req = { ms / 1000, (ms % 1000) * 1000000L };
+	double end;
+
+	for (;;) {
+		if (nanosleep(&req, &req) == 0) {
+			sleep_errno = 0;
+			return;
+		}
+		if (errno != EINTR)
+			break;
+	}
+	sleep_errno = errno;
+
+	end = clk_read(CLK_GTOD);
+	if (end < 0) {
+		/* no clock at all: a rough delay */
+		for (volatile long i = 0; i < ms * 2000L; i++)
+			;
+		return;
+	}
+	end += ms / 1000.0;
+	while (clk_read(CLK_GTOD) < end)
+		sched_yield();
+}
+
+/* elapsed time of each source over a sleep of ms milliseconds */
+static void clk_measure(long ms, double dt[NCLK])
+{
+	double t0[NCLK];
+	int i;
+
+	for (i = 0; i < NCLK; i++)
+		t0[i] = clk_read(i);
+	dhry_sleep_ms(ms);
+	for (i = 0; i < NCLK; i++)
+		dt[i] = (t0[i] < 0) ? -1 : clk_read(i) - t0[i];
+}
+
+/* pick the first source that advances over a 50 ms sleep */
+static int clk_select(void)
+{
+	double dt[NCLK];
+
+	clk_measure(50, dt);
+	for (int i = 0; i < NCLK; i++) {
+		if (dt[i] > 0.025) {
+			clk_src = i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/*
+ * clocktest [MHz]: what each time source measures over a 1 s sleep.
+ * nanosleep is timed by the kernel tick, independent of the sources; if
+ * nanosleep fails, the sleep is timed with gettimeofday instead.
+ */
+static int cmd_clocktest(int argc, char **argv)
+{
+	double dt[NCLK];
+	struct timespec ts = { 0, 0 };
+	long r;
+	uint64_t c0, c1;
+
+	if (argc > 1 && strtod(argv[1], NULL) > 0)
+		clk_mhz = strtod(argv[1], NULL);
+
+	r = clock_gettime(CLOCK_MONOTONIC, &ts);
+	printf("clock_gettime(CLOCK_MONOTONIC): ret %ld, %s, %ld.%09ld\n",
+	       r, r ? strerror(errno) : "ok", (long)ts.tv_sec, (long)ts.tv_nsec);
+#ifdef SYS_clock_gettime
+	ts.tv_sec = ts.tv_nsec = 0;
+	r = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+	printf("syscall clock_gettime:          ret %ld, %s, %ld.%09ld\n",
+	       r, r ? strerror(errno) : "ok", (long)ts.tv_sec, (long)ts.tv_nsec);
+#endif
+
+	printf("measuring over a 1 s sleep...\n");
+	fflush(stdout);
+	c0 = clk_counter();
+	clk_measure(1000, dt);
+	c1 = clk_counter();
+	if (sleep_errno)
+		printf("  nanosleep failed: %s; the sleep was timed with gettimeofday\n",
+		       strerror(sleep_errno));
+	else
+		printf("  nanosleep ok\n");
+	for (int i = 0; i < NCLK; i++) {
+		if (dt[i] < 0)
+			printf("  %-27s not available\n", clk_name[i]);
+		else
+			printf("  %-27s %.6f s\n", clk_name[i], dt[i]);
+	}
+	if (MD_HAVE_ASM)
+		printf("  stable counter: %llu ticks, %.3f MHz if the sleep was 1 s\n",
+		       (unsigned long long)(c1 - c0), (c1 - c0) / 1e6);
+	if (sleep_errno == ENOSYS)
+		printf("  the kernel lacks the 32-bit time system calls: set CONFIG_COMPAT_32BIT_TIME=y\n");
+	return 0;
+}
+
+#define DHRY_MAX_RUNS	100000000L	/* calibration limit, fits a 32-bit long */
+
+/*
+ * Short correctness run in a child process, so that a CPU that loops in
+ * Proc_2() or Func_2() (wrong character compare or byte load/store) is
+ * reported instead of hanging the shell. alarm()/setitimer() are not
+ * available (CONFIG_POSIX_TIMERS is not set), so the parent polls.
+ * Returns 0 ok, 1 wrong result, 2 did not finish in limit_ms.
+ */
+static int dhry_check_child(long runs, long limit_ms)
+{
+	pid_t pid;
+	int st;
+
+	fflush(stdout);
+	pid = fork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		struct dhry_locals loc;
+
+		dhry_run(runs, &loc);
+		if (!dhry_check(runs, &loc)) {
+			fflush(stdout);
+			_exit(1);
+		}
+		_exit(0);
+	}
+	for (long waited = 0; waited < limit_ms; waited += 10) {
+		if (waitpid(pid, &st, WNOHANG) == pid)
+			return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+		dhry_sleep_ms(10);
+	}
+	kill(pid, SIGKILL);
+	waitpid(pid, &st, 0);
+	return 2;
+}
+
+static int cmd_dhrystone(int argc, char **argv)
+{
+	long runs = argc > 1 ? atol(argv[1]) : 0;
+	double mhz = argc > 2 ? strtod(argv[2], NULL) : 75.0;
+	struct dhry_locals loc;
+	double t0, t, dps, dmips;
+	int ok;
+
+	if (mhz <= 0)
+		mhz = 75.0;
+	clk_mhz = mhz;
+
+	/* correctness first: 1 and 10 runs take microseconds */
+	{
+		static const long quick[] = { 1, 10 };
+
+		for (size_t i = 0; i < sizeof(quick) / sizeof(quick[0]); i++) {
+			int r = dhry_check_child(quick[i], 5000);
+
+			if (r == 2) {
+				printf("dhrystone: %ld run(s) did not finish in 5 s: the CPU loops in Proc_2 or Func_2 (character compare, byte load/store); run mdtest\n",
+				       quick[i]);
+				return 1;
+			}
+			if (r) {
+				printf("dhrystone: wrong result after %ld run(s), see the lines above; run mdtest\n",
+				       quick[i]);
+				return 1;
+			}
+		}
+	}
+
+	if (clk_select() < 0) {
+		printf("dhrystone: no time source advances over a 50 ms sleep; run clocktest\n");
+		return 1;
+	}
+	printf("dhrystone: timing with %s%s\n", clk_name[clk_src],
+	       clk_src == CLK_COUNTER ? " (assumes it counts at the given MHz)" : "");
+
+	if (runs > 0) {
+		t0 = dhry_now();
+		dhry_run(runs, &loc);
+		t = dhry_now() - t0;
+	} else {
+		/* calibrate to about 2 s; 3-5 s in total */
+		printf("dhrystone: calibrating to about 2 s\n");
+		runs = 1000;
+		for (;;) {
+			double next;
+
+			t0 = dhry_now();
+			dhry_run(runs, &loc);
+			t = dhry_now() - t0;
+			printf("  %ld runs: %.3f s\n", runs, t);
+			fflush(stdout);
+			if (t >= 2.0 || runs >= DHRY_MAX_RUNS)
+				break;
+			/* grow by at most 10x per step, so a coarse clock cannot overshoot */
+			next = t < 0.2 ? runs * 10.0 : runs * (2.2 / t);
+			runs = next > DHRY_MAX_RUNS ? DHRY_MAX_RUNS : (long)next;
+		}
+	}
+
+	printf("Dhrystone 2.1: %ld runs in %.3f s\n", runs, t);
+	ok = dhry_check(runs, &loc);
+	if (t <= 0) {
+		printf("  time too short to measure\n");
+		return 1;
+	}
+	if (t < 1.0)
+		printf("  less than 1 s measured, use more runs for an accurate result\n");
+
+	dps = runs / t;
+	dmips = dps / 1757.0;
+	printf("  %.0f Dhrystones/s, %.2f us per run\n", dps, 1e6 * t / runs);
+	printf("  %.2f DMIPS, %.3f DMIPS/MHz at %.1f MHz\n", dmips, dmips / mhz, mhz);
+	printf("  results %s\n", ok ? "ok" : "WRONG");
+	fflush(stdout);
+	return !ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* mdtest: multiply, divide and byte/halfword load/store               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * mdtest [n]
+ *
+ * Runs each instruction on special values and n random operand pairs
+ * (default 100000) and compares with a reference computed in software
+ * with shifts and adds only, so the reference does not depend on the
+ * hardware multiplier or divider.
+ *
+ *   mul.w mulh.w mulh.wu      32x32 -> low / high 32 bits
+ *   div.w div.wu mod.w mod.wu  divisor 0 and INT_MIN / -1 are skipped
+ *                              (undefined in LoongArch)
+ *   result used by the next instruction (bypass after mul / div)
+ *   ld.b ld.bu ld.h ld.hu st.b st.h at every offset
+ *
+ * On LoongArch the instructions are forced with inline asm; on other
+ * hosts the C operators are used, which only checks the reference code.
+ */
+
+#if MD_HAVE_ASM
+#define MD_ASM3(insn, a, b) ({						\
+	uint32_t __r;							\
+	__asm__ volatile(insn " %0, %1, %2" : "=r"(__r) : "r"(a), "r"(b));\
+	__r;								\
+})
+static uint32_t hw_mul_w(uint32_t a, uint32_t b)    { return MD_ASM3("mul.w", a, b); }
+static uint32_t hw_mulh_w(uint32_t a, uint32_t b)   { return MD_ASM3("mulh.w", a, b); }
+static uint32_t hw_mulh_wu(uint32_t a, uint32_t b)  { return MD_ASM3("mulh.wu", a, b); }
+static uint32_t hw_div_w(uint32_t a, uint32_t b)    { return MD_ASM3("div.w", a, b); }
+static uint32_t hw_div_wu(uint32_t a, uint32_t b)   { return MD_ASM3("div.wu", a, b); }
+static uint32_t hw_mod_w(uint32_t a, uint32_t b)    { return MD_ASM3("mod.w", a, b); }
+static uint32_t hw_mod_wu(uint32_t a, uint32_t b)   { return MD_ASM3("mod.wu", a, b); }
+
+/* result consumed by the very next instruction */
+static uint32_t hw_mul_use(uint32_t a, uint32_t b)
+{
+	uint32_t r, s;
+
+	__asm__ volatile("mul.w %0, %2, %3\n\tadd.w %1, %0, %0"
+			 : "=&r"(r), "=r"(s) : "r"(a), "r"(b));
+	(void)r;
+	return s;
+}
+
+static uint32_t hw_div_use(uint32_t a, uint32_t b)
+{
+	uint32_t r, s;
+
+	__asm__ volatile("div.wu %0, %2, %3\n\tadd.w %1, %0, %0"
+			 : "=&r"(r), "=r"(s) : "r"(a), "r"(b));
+	(void)r;
+	return s;
+}
+#else
+static uint32_t hw_mul_w(uint32_t a, uint32_t b)    { return a * b; }
+static uint32_t hw_mulh_w(uint32_t a, uint32_t b)   { return (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32); }
+static uint32_t hw_mulh_wu(uint32_t a, uint32_t b)  { return (uint32_t)(((uint64_t)a * b) >> 32); }
+static uint32_t hw_div_w(uint32_t a, uint32_t b)    { return (uint32_t)((int32_t)a / (int32_t)b); }
+static uint32_t hw_div_wu(uint32_t a, uint32_t b)   { return a / b; }
+static uint32_t hw_mod_w(uint32_t a, uint32_t b)    { return (uint32_t)((int32_t)a % (int32_t)b); }
+static uint32_t hw_mod_wu(uint32_t a, uint32_t b)   { return a % b; }
+static uint32_t hw_mul_use(uint32_t a, uint32_t b)  { return 2 * (a * b); }
+static uint32_t hw_div_use(uint32_t a, uint32_t b)  { return 2 * (a / b); }
+#endif
+
+/* reference: unsigned 32x32 -> 64 with shifts and adds */
+static uint64_t ref_mulu64(uint32_t a, uint32_t b)
+{
+	uint64_t acc = 0, x = a;
+
+	for (int i = 0; i < 32; i++) {
+		if (b & 1)
+			acc += x;
+		x <<= 1;
+		b >>= 1;
+	}
+	return acc;
+}
+
+static uint64_t ref_muls64(uint32_t a, uint32_t b)
+{
+	uint64_t p = ref_mulu64(a, b);
+
+	/* signed product = unsigned product - (a<0 ? b<<32) - (b<0 ? a<<32) */
+	if ((int32_t)a < 0)
+		p -= (uint64_t)b << 32;
+	if ((int32_t)b < 0)
+		p -= (uint64_t)a << 32;
+	return p;
+}
+
+/* reference: restoring division, b != 0 */
+static void ref_divu(uint32_t a, uint32_t b, uint32_t *q, uint32_t *r)
+{
+	uint32_t quo = 0, rem = 0;
+
+	for (int i = 31; i >= 0; i--) {
+		int carry = rem >> 31;
+
+		rem = (rem << 1) | ((a >> i) & 1);
+		if (carry || rem >= b) {
+			rem -= b;
+			quo |= 1u << i;
+		}
+	}
+	*q = quo;
+	*r = rem;
+}
+
+/* signed: quotient rounded toward zero, remainder has the sign of a */
+static void ref_divs(uint32_t a, uint32_t b, uint32_t *q, uint32_t *r)
+{
+	int neg_a = (int32_t)a < 0, neg_b = (int32_t)b < 0;
+	uint32_t ua = neg_a ? 0u - a : a, ub = neg_b ? 0u - b : b, uq, ur;
+
+	ref_divu(ua, ub, &uq, &ur);
+	*q = (neg_a != neg_b) ? 0u - uq : uq;
+	*r = neg_a ? 0u - ur : ur;
+}
+
+static uint32_t md_seed = 0x12345678;
+
+static uint32_t md_rand(void)
+{
+	static const uint32_t special[] = {
+		0, 1, 2, 3, 7, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000,
+		0x7fffffff, 0x80000000, 0x80000001, 0xfffffffe, 0xffffffff,
+		0x55555555, 0xaaaaaaaa, 0x12345678, 0xedcba987,
+	};
+
+	md_seed = md_seed * 1664525u + 1013904223u;
+	switch (md_seed >> 29) {
+	case 0:
+		return special[(md_seed >> 8) % (sizeof(special) / sizeof(special[0]))];
+	case 1:
+		return (md_seed >> 8) & 0xff;		/* small */
+	case 2:
+		return 0u - ((md_seed >> 8) & 0xff);	/* small negative */
+	default:
+		md_seed = md_seed * 1664525u + 1013904223u;
+		return md_seed ^ (md_seed >> 13);
+	}
+}
+
+struct md_count {
+	const char *name;
+	long bad;
+};
+
+static void md_report(struct md_count *c, uint32_t a, uint32_t b,
+		      uint32_t got, uint32_t exp)
+{
+	if (c->bad < 5)
+		printf("  %-8s %08x, %08x: got %08x, expected %08x\n",
+		       c->name, a, b, got, exp);
+	c->bad++;
+}
+
+static int md_bytes(void)
+{
+	volatile union {
+		uint8_t b[16];
+		uint16_t h[8];
+		uint32_t w[4];
+	} buf;
+	int bad = 0;
+
+	for (int off = 0; off < 8; off++) {
+		for (int v = 0; v < 256; v += 0x35) {
+			uint8_t val = (uint8_t)(v ^ 0x80);
+			int32_t sb;
+			uint32_t ub;
+
+			for (int i = 0; i < 4; i++)
+				buf.w[i] = 0xa5a5a5a5;
+#if MD_HAVE_ASM
+			{
+				volatile uint8_t *p = &buf.b[off];
+
+				__asm__ volatile("st.b %0, %1, 0" :: "r"((uint32_t)val), "r"(p) : "memory");
+				__asm__ volatile("ld.b %0, %1, 0" : "=r"(sb) : "r"(p) : "memory");
+				__asm__ volatile("ld.bu %0, %1, 0" : "=r"(ub) : "r"(p) : "memory");
+			}
+#else
+			buf.b[off] = val;
+			sb = (int8_t)buf.b[off];
+			ub = buf.b[off];
+#endif
+			if (sb != (int8_t)val || ub != val) {
+				if (bad < 5)
+					printf("  byte off %d val %02x: ld.b %08x ld.bu %08x\n",
+					       off, val, (uint32_t)sb, ub);
+				bad++;
+			}
+			/* neighbours must not change */
+			for (int i = 0; i < 16; i++) {
+				if (i != off + 0 && buf.b[i] != 0xa5) {
+					if (bad < 5)
+						printf("  st.b off %d changed byte %d to %02x\n",
+						       off, i, buf.b[i]);
+					bad++;
+				}
+			}
+		}
+	}
+
+	for (int off = 0; off < 8; off += 2) {
+		uint16_t val = 0x8a5c;
+		int32_t sh;
+		uint32_t uh;
+
+		for (int i = 0; i < 4; i++)
+			buf.w[i] = 0x5a5a5a5a;
+#if MD_HAVE_ASM
+		{
+			volatile uint8_t *p = &buf.b[off];
+
+			__asm__ volatile("st.h %0, %1, 0" :: "r"((uint32_t)val), "r"(p) : "memory");
+			__asm__ volatile("ld.h %0, %1, 0" : "=r"(sh) : "r"(p) : "memory");
+			__asm__ volatile("ld.hu %0, %1, 0" : "=r"(uh) : "r"(p) : "memory");
+		}
+#else
+		buf.h[off / 2] = val;
+		sh = (int16_t)buf.h[off / 2];
+		uh = buf.h[off / 2];
+#endif
+		if (sh != (int16_t)val || uh != val) {
+			if (bad < 10)
+				printf("  half off %d: ld.h %08x ld.hu %08x\n",
+				       off, (uint32_t)sh, uh);
+			bad++;
+		}
+	}
+	return bad;
+}
+
+static int cmd_mdtest(int argc, char **argv)
+{
+	long n = argc > 1 ? atol(argv[1]) : 100000;
+	struct md_count c[] = {
+		{ "mul.w" }, { "mulh.w" }, { "mulh.wu" },
+		{ "div.w" }, { "div.wu" }, { "mod.w" }, { "mod.wu" },
+		{ "mul+use" }, { "div+use" },
+	};
+	long total = 0;
+	int bbad;
+
+	printf("mdtest: %ld random operand pairs, %s\n", n,
+	       MD_HAVE_ASM ? "instructions forced with inline asm"
+			   : "WARNING: no LoongArch macro, testing C operators only");
+	fflush(stdout);
+
+	for (long i = 0; i < n; i++) {
+		uint32_t a = md_rand(), b = md_rand();
+		uint64_t pu = ref_mulu64(a, b), ps = ref_muls64(a, b);
+		uint32_t q, r, got;
+
+		if ((got = hw_mul_w(a, b)) != (uint32_t)pu)
+			md_report(&c[0], a, b, got, (uint32_t)pu);
+		if ((got = hw_mulh_w(a, b)) != (uint32_t)(ps >> 32))
+			md_report(&c[1], a, b, got, (uint32_t)(ps >> 32));
+		if ((got = hw_mulh_wu(a, b)) != (uint32_t)(pu >> 32))
+			md_report(&c[2], a, b, got, (uint32_t)(pu >> 32));
+		if ((got = hw_mul_use(a, b)) != (uint32_t)pu * 2)
+			md_report(&c[7], a, b, got, (uint32_t)pu * 2);
+
+		if (b == 0)
+			continue;
+		ref_divu(a, b, &q, &r);
+		if ((got = hw_div_wu(a, b)) != q)
+			md_report(&c[4], a, b, got, q);
+		if ((got = hw_mod_wu(a, b)) != r)
+			md_report(&c[6], a, b, got, r);
+		if ((got = hw_div_use(a, b)) != q * 2)
+			md_report(&c[8], a, b, got, q * 2);
+
+		if (a == 0x80000000u && b == 0xffffffffu)
+			continue;
+		ref_divs(a, b, &q, &r);
+		if ((got = hw_div_w(a, b)) != q)
+			md_report(&c[3], a, b, got, q);
+		if ((got = hw_mod_w(a, b)) != r)
+			md_report(&c[5], a, b, got, r);
+	}
+
+	for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+		printf("  %-8s %s", c[i].name, c[i].bad ? "" : "ok\n");
+		if (c[i].bad)
+			printf("%ld wrong\n", c[i].bad);
+		total += c[i].bad;
+	}
+	bbad = md_bytes();
+	printf("  bytes    %s", bbad ? "" : "ok\n");
+	if (bbad)
+		printf("%d wrong\n", bbad);
+	total += bbad;
+
+	printf("mdtest: %s\n", total ? "FAIL" : "PASS");
+	return total != 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* cpiperf: cycles per instruction by instruction type                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * cpiperf [loops]
+ *
+ * Runs 32 copies of one instruction in a loop and divides the elapsed
+ * stable-counter ticks by the number of instructions. On cpu7b the
+ * counter counts sys_clk cycles, so the result is in CPU cycles. The
+ * loop branch adds 2 instructions per 32 (about 6%); timer interrupts
+ * add a little noise.
+ *
+ * What the numbers show:
+ *   nop / add.w     instruction fetch: about 1-3 with the icache on,
+ *                   tens of cycles if every fetch goes to SDRAM
+ *   ld.w / st.w     a load or store: there is no data cache, so each
+ *                   one is an AXI access to SDRAM
+ *   b               a taken branch (redirect at W plus refetch)
+ *   mul.w / div.w   multiplier and divider latency
+ */
+#if MD_HAVE_ASM
+#define CPI_LOOP(insn)							\
+	__asm__ volatile(						\
+		"9:\n"							\
+		".rept 32\n"						\
+		insn "\n"						\
+		".endr\n"						\
+		"addi.w %0, %0, -1\n"					\
+		"bnez   %0, 9b\n"					\
+		: "+r"(n)						\
+		: "r"(p), "r"(v1), "r"(v2)				\
+		: "$r12", "memory")
+
+static double cpi_one(int kind, long loops)
+{
+	static volatile uint32_t cpi_buf[16] __attribute__((aligned(64)));
+	volatile uint32_t *p = cpi_buf;
+	uint32_t v1 = 0x12345, v2 = 7;
+	long n = loops;
+	uint64_t c0, c1;
+
+	c0 = clk_counter();
+	switch (kind) {
+	case 0: CPI_LOOP("nop"); break;
+	case 1: CPI_LOOP("add.w $r12, %2, %3"); break;
+	case 2: CPI_LOOP("ld.w $r12, %1, 0"); break;
+	case 3: CPI_LOOP("st.w %2, %1, 0"); break;
+	case 4: CPI_LOOP("b 1f\n1:"); break;
+	case 5: CPI_LOOP("mul.w $r12, %2, %3"); break;
+	case 6: CPI_LOOP("div.w $r12, %2, %3"); break;
+	}
+	c1 = clk_counter();
+	return (double)(c1 - c0) / ((double)loops * 32);
+}
+
+static int cmd_cpiperf(int argc, char **argv)
+{
+	static const char *const name[] = {
+		"nop", "add.w", "ld.w", "st.w", "b (taken)", "mul.w", "div.w",
+	};
+	long loops = argc > 1 ? atol(argv[1]) : 2000;
+
+	if (loops < 1)
+		loops = 1;
+	printf("cpiperf: %ld loops x 32 instructions, cycles per instruction\n", loops);
+	for (int k = 0; k < 7; k++) {
+		cpi_one(k, 10);		/* warm up: TLB, icache, page faults */
+		printf("  %-10s %8.2f\n", name[k], cpi_one(k, loops));
+		fflush(stdout);
+	}
+	return 0;
+}
+#else
+static int cmd_cpiperf(int argc, char **argv)
+{
+	printf("cpiperf: needs LoongArch inline asm\n");
+	return 1;
+}
+#endif
+
 struct builtin {
 	const char *name;
 	int (*fn)(int argc, char **argv);
@@ -1316,6 +2352,10 @@ static const struct builtin builtins[] = {
 	{ "snp",      cmd_snp,      "one snprintf in this process" },
 	{ "snptest",  cmd_snptest,  "snptest [n]: first snprintf in n fresh processes" },
 	{ "fartest",  cmd_fartest,  "fartest [n]: call into an unmapped code page in n fresh processes" },
+	{ "dhrystone", cmd_dhrystone, "dhrystone [runs] [MHz]: Dhrystone 2.1 benchmark" },
+	{ "clocktest", cmd_clocktest, "clocktest [MHz]: compare the time sources over a 1 s sleep" },
+	{ "cpiperf",  cmd_cpiperf,  "cpiperf [loops]: cycles per instruction for nop/add/ld/st/b/mul/div" },
+	{ "mdtest",   cmd_mdtest,   "mdtest [n]: check mul/div/mod and byte/halfword load/store" },
 	{ "exit",     cmd_exit,     "exit [status] (not allowed as init)" },
 };
 
